@@ -4,6 +4,7 @@ import os
 import socket
 import logging
 import threading
+import select
 
 log = logging.getLogger('proxy')
 
@@ -22,6 +23,7 @@ class JustRecvSock(FixedDispatcher):
 
 class Sock(FixedDispatcher):
     write_buffer = ''
+    socks = None
     def __init__(self, *args, **kwargs):
         FixedDispatcher.__init__(self, *args, **kwargs)
         self.left_port = self.getsockname()[1]
@@ -40,6 +42,10 @@ class Sock(FixedDispatcher):
     def handle_close(self):
         log.info(' [-] %i -> %i (closed)' % (self.left_port, self.right_port))
         self.close()
+        if self.socks:
+            self.socks.remove( self )
+        if self.other.socks:
+            self.other.socks.remove( self.other )
         if self.other.other:
             self.other.close()
             self.other = None
@@ -56,6 +62,7 @@ class Server(FixedDispatcher):
         log.info(' [*] Proxying %i ==> %i' % \
                      (self.src_port, self.dst_port))
         self.listen(5)
+        self.socks = []
 
     def handle_accept(self):
         pair = self.accept()
@@ -75,10 +82,15 @@ class Server(FixedDispatcher):
                           right.getsockname()[1], self.dst_port))
             a, b = Sock(left, map=self.map), Sock(right, map=self.map)
             a.other, b.other = b, a
+            a.socks = self.socks
+            self.socks.append( a )
 
     def close(self):
+        while self.socks:
+            self.socks[0].handle_close()
         log.info(' [*] Closed %i ==> %i' % \
                      (self.src_port, self.dst_port))
+        self.shutdown(True)
         asyncore.dispatcher.close(self)
 
 
@@ -102,7 +114,12 @@ class AsyncoreRunner(threading.Thread):
     def run(self):
         log.debug(' [ ] Proxy thread started')
         while not self.exit:
-            asyncore.loop(map=self.map, count=1)
+            try:
+                asyncore.loop(map=self.map, count=1, use_poll=False)
+            except select.error, e:
+                # Sometimes there is a race between 'ping' and closing
+                # a socket. Select can return 9/EBADF in such case.
+                if e[0] is not errno.EBADF: raise
         log.debug(' [ ] Proxy thread stopped')
 
     def close(self):

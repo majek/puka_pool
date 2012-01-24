@@ -21,7 +21,7 @@ except ImportError:
 
 Message = collections.namedtuple('Message', ['msg_id', 'args', 'kwargs'])
 Consumer = collections.namedtuple('Consumer', ['con_id', 'args', 'kwargs'])
-
+Received = collections.namedtuple('Received', [])
 
 class _Pool:
     def __init__(self):
@@ -74,12 +74,17 @@ class _Pool:
                 continue
 
             r, w, e = select.select(rfds, wfds, rfds, self.next_timer(quit_after))
-            for n in itertools.chain(r, e):
+            for n in set(itertools.chain(r, e)):
                 try:
                     n.client.on_read()
                 except socket.error, e:
                     if e.errno is not errno.ECONNREFUSED: raise
                     n.mark_dead()
+                    do_break = True
+                if not n.client or not n.client.sd:
+                    do_break = True
+            if do_break:
+                continue
 
             for n in w:
                 if not n.client:
@@ -89,6 +94,7 @@ class _Pool:
                 except socket.error, e:
                     if e.errno is not errno.ECONNREFUSED: raise
                     n.mark_dead()
+
             if (not r and not e and not w
                 and quit_after
                 and time.time() >= quit_after):
@@ -182,7 +188,7 @@ class AtLeastOnePool(_Pool):
                           for msg_id in self.unsent_messages])
         self.unsent_messages = []
 
-    def nack(self, list_of_msg_id, node):
+    def on_nack(self, list_of_msg_id, node):
         for msg_id in list_of_msg_id:
             self.emit(msg_id, Result('nack', MINOR, node=node.amqp_url))
         um = list_of_msg_id[:]
@@ -190,12 +196,12 @@ class AtLeastOnePool(_Pool):
         self.unsent_messages = um
         self.maybe_flush()
 
-    def permanent_nack(self, msg_id, node, amqp_result):
+    def on_permanent_nack(self, msg_id, node, amqp_result):
         self.emit(msg_id, Result('nack', FINAL, node=node.amqp_url,
                                  amqp_result=amqp_result, is_error=True))
         del self.messages[msg_id]
 
-    def ack(self, msg_id, node):
+    def on_ack(self, msg_id, node):
         self.emit(msg_id, Result('ack', FINAL, node=node.amqp_url))
         msg = self.messages[msg_id]
         del self.messages[msg_id]
@@ -220,12 +226,28 @@ class AtLeastOnePool(_Pool):
             if node.client:
                 node.client.basic_ack(amqp_result)
         consumer = self.consumes[con_id]
-        self.emit(con_id, Result('message', MAJOR, node=node.amqp_url,
-                                 amqp_result=amqp_result,
+        if amqp_result.is_error:
+            if isinstance(amqp_result.exception, puka.ConnectionBroken):
+                self.emit(con_id, Result('cancel', MINOR, node=node.amqp_url))
+                self.promises.rollback_emit(con_id, lambda r:r.event == 'message')
+            else:
+                raise amqp_result.exception
+        else:
+            self.emit(con_id, Result('message', MAJOR, node=node.amqp_url,
+                                     amqp_result=amqp_result,
                                  ack=do_ack \
-                                     if not consumer.kwargs.get('no_ack') \
-                                     else None))
+                                         if not consumer.kwargs.get('no_ack') \
+                                         else None))
 
+    def ack(self, result):
+        nodes = [n for n in self.nodes \
+                     if n.amqp_url is result.amqp_url and n.status is OPEN]
+        if not nodes: return
+        node = nodes[0]
+        if node: pass
+        self.emit(msg_id, Result('ack', FINAL, node=node.amqp_url))
+        msg = self.messages[msg_id]
+        del self.messages[msg_id]
 
 DEAD=0
 CONNECTING=1
@@ -249,7 +271,7 @@ class Node:
     def do_connect(self):
         self.status = CONNECTING
         self.messages = OrderedDict()
-        self.consumes_id = set()
+        self.consumes_id = {}
         self.client = puka.Client(str(self.amqp_url), pubacks=True)
         self.client.connect(callback=self.on_connect)
         log.info('#%s connecting... ' % (self.amqp_url,))
@@ -277,10 +299,11 @@ class Node:
         if self.status == WAITING:
             return
         self.status = WAITING
-        self.client.close()
+        if self.client.sd:
+            self.client.close()
         self.client = None
 
-        self.cluster.nack(self.messages.keys(), self)
+        self.cluster.on_nack(self.messages.keys(), self)
         self.messages.clear()
 
         to, self.timeout = self.timeout, min(self.timeout**2,
@@ -310,24 +333,37 @@ class Node:
         self.client.basic_publish(*msg.args, **pub_kwargs)
 
     def on_publish(self, msg_id, result):
+        if result.is_error and isinstance(result.exception, puka.ConnectionBroken):
+            if msg_id in self.messages:
+                del self.messages[msg_id]
+                self.cluster.on_nack([msg_id], self)
+            return
+
         del self.messages[msg_id]
         if not result.is_error:
-            self.cluster.ack(msg_id, self)
+            self.cluster.on_ack(msg_id, self)
         else:
-            self.cluster.permanent_nack(msg_id, self, result)
+            self.cluster.on_permanent_nack(msg_id, self, result)
 
     def consume(self, consumes):
         for consume in consumes:
             self._consume(consume)
 
     def _consume(self, consume):
-        self.consumes_id.add(consume.con_id)
+        self.consumes_id[ ] = consume.con_id
         con_kwargs = consume.kwargs.copy()
         def on_consume(_promise, result):
             self.on_consume(consume.con_id, result)
         con_kwargs['callback'] = on_consume
-        self.client.basic_consume(*consume.args, **con_kwargs)
+        t = self.client.basic_consume(*consume.args, **con_kwargs)
 
     def on_consume(self, con_id, result):
-        self.cluster.on_consume(con_id, self, result)
+        if result.is_error:
+            if isinstance(amqp_result.exception, puka.ConnectionBroken):
+                self.promises.rollback_emit(con_id, lambda r:r.event == 'message')
+                self.emit(con_id, Result('cancel', MINOR, node=node.amqp_url))
+            else:
+                raise amqp_result.exception
+        else:
+            self.cluster.on_consume(con_id, self, result)
 

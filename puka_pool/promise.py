@@ -34,6 +34,9 @@ class PromiseCollection(object):
         if result.kind is FINAL:
             del self._promises[number]
 
+    def rollback_emit(self, number, filter_fun):
+        promise = self._promises[number].rollback_emit(filter_fun)
+
 class Promise(object):
     def __init__(self, number):
         self.number = number
@@ -52,6 +55,9 @@ class Promise(object):
                 if self.major_callback:
                     self.major_callback(self, result)
                 return result
+
+    def rollback_emit(self, filter_fun):
+        self.results = filter(lambda a:not filter_fun(a), self.results)
 
 class Result(dict):
     event = None
